@@ -1,0 +1,6 @@
+train_Sentense_np: 287351*50*200
+dev_Sentense_np: 38417*50*200
+test_Sentense_np: 77092*50*200
+Relation属性为-1表示为填充
+train_Relation_np: 287351*2
+dev_Relation_np: 38417*2
