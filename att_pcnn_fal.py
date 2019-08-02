@@ -59,9 +59,9 @@ def get_en_pos(words, en1, en2):
             en1_pos = i
         if words[i] == en2:
             en2_pos = i
-    if en1 is None:
+    if en1_pos is None:
         en1_pos = 0
-    if en2 is None:
+    if en2_pos is None:
         en2_pos = len(words) - 1
     return en1_pos, en2_pos
 
@@ -87,7 +87,9 @@ def make_input_data(fname: str, test=False):
                 word_indices_list.append(word_indices)
                 label_list.append(lbl)
 
-            return sen_id_list, en_pos_list, torch.LongTensor(word_indices_list), torch.LongTensor(label_list)
+            return sen_id_list, torch.LongTensor(en_pos_list), \
+                   torch.LongTensor(word_indices_list), \
+                   torch.LongTensor(label_list)
         for line in f:
             content = line.split()
             sen_id = content[0]
@@ -103,21 +105,28 @@ def make_input_data(fname: str, test=False):
             en_pos_list.append(en_pos)
             word_indices_list.append(word_indices)
 
-        return sen_id_list, en_pos_list, torch.LongTensor(word_indices_list)
+        return sen_id_list, \
+               torch.LongTensor(en_pos_list), torch.LongTensor(word_indices_list)
 
 
-_, train_en_pos_list, X_train, y_train = make_input_data(train_path)
-_, val_en_pos_list, X_val, y_val = make_input_data(val_path)
+_, train_en_pos, X_train, y_train = make_input_data(train_path)
+_, val_en_pos, X_val, y_val = make_input_data(val_path)
 
-train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
+train_dataset = torch.utils.data.TensorDataset(X_train, y_train, train_en_pos)
 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=500, shuffle=True)
 
-val_dataset = torch.utils.data.TensorDataset(X_val, y_val)
+val_dataset = torch.utils.data.TensorDataset(X_val, y_val, val_en_pos)
 val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1000)
 
 y_non_zero_indices = (y_val != 0)
-val_nonzero_dataset = torch.utils.data.TensorDataset(X_val[y_non_zero_indices], y_val[y_non_zero_indices])
+val_nonzero_dataset = torch.utils.data.TensorDataset(X_val[y_non_zero_indices],
+                                                     y_val[y_non_zero_indices],
+                                                     val_en_pos[y_non_zero_indices])
 val_nonzero_loader = torch.utils.data.DataLoader(val_nonzero_dataset, batch_size=1000)
+
+# ## model
+
+# In[5]:
 
 # ## model
 
@@ -130,29 +139,58 @@ n_classes = torch.unique(y_train).size()[0]
 class_freq_inverse = [len(y_train) / (y_train == i).sum().item() for i in range(n_classes)]
 
 
-class AttLSTMNet(nn.Module):
-    def __init__(self, n_classes=35, embd_dim=300, lstm_hidden=200, dense_hidden=100):
-        super(AttLSTMNet, self).__init__()
-        self.lstm_hidden = lstm_hidden
+class PCNNNet(nn.Module):
+    def __init__(self, n_classes=35, embd_dim=300, sequence_length=40, out_channels=35, kernel_height=3,
+                 dense_hidden=30):
+        super(PCNNNet, self).__init__()
         self.embed = nn.Embedding.from_pretrained(w2v_weights)
-        self.lstm = nn.LSTM(embd_dim, lstm_hidden, num_layers=1, batch_first=True, bidirectional=True)
-        self.dense = nn.Linear(lstm_hidden * 2, dense_hidden)
-        self.out = nn.Linear(dense_hidden, n_classes)
+        self.conv = nn.Conv2d(in_channels=1,
+                              out_channels=out_channels,
+                              kernel_size=(kernel_height, embd_dim),
+                              padding=(1, 0))
+        self.pmp = nn.MaxPool2d((sequence_length - kernel_height + 1, 1))
+        # self.dense = nn.Linear(out_channels * 3, dense_hidden)
+        self.out = nn.Linear(sequence_length * 3, n_classes)
+        self.sequence_length = sequence_length
 
-    def forward(self, X):
-        embed = self.embed(X)  # [batch, sequence_length=40, embd_dim]
-        lstm_out, (final_hidden_state, _) = self.lstm(embed)
-        # [batch, sequence_length=40, 2*lstm_hidden], [batch, 2*lstm_hidden]
-        # attention mechanism
-        # final_hidden_state : [batch_size, n_hidden * num_directions(=2), 1(=n_layer)]
-        final_hidden_state = final_hidden_state.view(-1, self.lstm_hidden * 2, 1)
-        attn_weights = torch.bmm(lstm_out, final_hidden_state).squeeze(
-            2)  # attn_weights : [batch_size, sequence_length]
-        soft_attn_weights = F.softmax(attn_weights, 1)
-        attn_out = torch.bmm(lstm_out.transpose(1, 2), soft_attn_weights.unsqueeze(2)).squeeze(2)
-        # attn_out : [batch, 2*lstm_hidden]
-        out = self.out(self.dense(attn_out))
-        return out
+    def forward(self, X, pos):
+        ep1 = pos[:, 0]
+        ep2 = pos[:, 1]
+        embed = self.embed(X).unsqueeze(1)  # [batch, 1, sequence_length=40, embd_dim]
+
+        conv = F.relu(self.conv(embed)).squeeze(3)
+
+        be1_mask = torch.zeros_like(conv)
+        aes_mask = torch.zeros_like(conv)
+        be2_mask = torch.zeros_like(conv)
+
+        # be1_pad = torch.ones_like(conv) * -100
+        # aes_pad = torch.ones_like(conv) * -100
+        # be2_pad = torch.ones_like(conv) * -100
+
+        for i in range(X.size(0)):
+            if ep1[i] > ep2[i]:
+                ep1[i], ep2[i] = ep2[i], ep1[i]
+            if ep1[i] == 0:
+                ep1[i] += 1
+                ep2[i] += 1
+            be1_mask[i, :, :ep1[i]] = 1
+            aes_mask[i, :, ep1[i]:ep2[i]] = 1
+            be2_mask[i, :, ep2[i]:] = 1
+        # be1 = conv * be1_mask + be1_pad
+        # aes = conv * aes_mask + aes_pad
+        # be2 = conv * be2_mask + be2_pad
+
+        be1 = conv * be1_mask
+        aes = conv * aes_mask
+        be2 = conv * be2_mask
+
+        p1 = self.pmp(be1)
+        p2 = self.pmp(aes)
+        p3 = self.pmp(be2)
+        pooled = torch.cat((p1, p2, p3), dim=2).view(-1, self.sequence_length * 3)
+
+        return self.out(pooled)
 
 
 class LGMLoss(nn.Module):
@@ -233,8 +271,8 @@ class FocalLoss(nn.Module):
 # In[6]:
 
 
-model = AttLSTMNet(n_classes, embd_dim).cuda()
-model_best = AttLSTMNet(n_classes, embd_dim)  # deep copy the model with best acc
+model = PCNNNet(n_classes, embd_dim, max_sen_length).cuda()
+model_best = PCNNNet(n_classes, embd_dim)  # deep copy the model with best acc
 
 # criterion = nn.CrossEntropyLoss().cuda()
 flloss = FocalLoss(gamma=2, alpha=class_freq_inverse).cuda()
@@ -250,11 +288,12 @@ def evaluate(acc=True, report=False, eval_nonzero=False):
     label_list = []
     loader = val_loader if not eval_nonzero else val_nonzero_loader
     with torch.no_grad():
-        for batch_idx, (X, y) in enumerate(loader):
+        for batch_idx, (X, y, pos) in enumerate(loader):
             X = X.cuda()
             label_list.extend(y)
             y = y.cuda()
-            out = model(X)
+            pos = pos.cuda()
+            out = model(X, pos)
             out, _, _ = lgmloss(out, y)
 
             pred = torch.argmax(out.data, 1)
@@ -288,12 +327,13 @@ try:
         correct = 0
         start_time = time.time()
         model.train()  # necessary if dropout is used
-        for i, (X_batch, y_batch) in enumerate(train_loader):
+        for i, (X_batch, y_batch, pos) in enumerate(train_loader):
             X_batch = X_batch.cuda()
             y_batch = y_batch.cuda()
+            pos = pos.cuda()
 
             optimizer.zero_grad()
-            outputs = model(X_batch)
+            outputs = model(X_batch, pos)
             outputs, lgm_loss, _ = lgmloss(outputs, y_batch)
             fl_loss = flloss(outputs, y_batch)
             # loss = criterion(outputs, y_batch)
@@ -336,17 +376,18 @@ evaluate(acc=False, report=True)
 
 test_id_list, test_en_pos_list, X_test = make_input_data(test_path, test=True)
 # X_test = X_test[:100]
-# test_dataset = torch.utils.data.TensorDataset(X_test)
-# test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=500)
+test_dataset = torch.utils.data.TensorDataset(X_test, test_en_pos_list)
+test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=500)
 result_list = []
 model_best = model_best.cuda()
 # lgmloss.to("cpu")
 # model_best = model
 with torch.no_grad():
     model_best.eval()
-    for i in range(0, X_test.size(0), 500):
-        X_batch = X_test[i:i + 500].cuda()
-        outputs = model_best(X_batch)
+    for i, (X_batch, pos) in enumerate(test_loader):
+        X_batch = X_batch.cuda()
+        pos = pos.cuda()
+        outputs = model_best(X_batch, pos)
         #             outputs = model_best(X_test)
         outputs, _, _ = lgmloss(outputs)
         prediction = torch.argmax(outputs.data, 1)
